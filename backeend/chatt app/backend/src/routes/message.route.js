@@ -1,59 +1,74 @@
+// routes/message.route.js
 import express from "express";
 import { protectRoute } from "../middleware/auth.middleware.js";
 import {
-    // Chat functions
+    // Chat functions (WORKING)
     getUserForSidebar,
     getMessages,
     sendMessage,
     getConversations,
-    // Post functions
+    uploadVoiceMessage,
+    uploadImageMessage,
+    uploadFileMessage,
+    
+    // Post functions (BASIC - WORKING)
     createPost,
     getFeedPosts,
+    getExplorePosts,
     toggleLikePost,
-    getNotifications,
-    getUserPosts,
-    // NEW: Comment functions
+    
+    // Comment functions (BASIC - WORKING)
     addComment,
     getPostComments,
-    deleteComment,
-    // NEW: Explore and search
-    getExplorePosts,
-    searchPosts,
-    deletePost,
+    
+    // Notifications (WORKING)
+    getNotifications,
+    
+    // Debug
+    debugChatData
 } from "../controllers/message.controller.js";
 import { uploadPostMiddleware } from "../middleware/upload.middleware.js";
 
 const router = express.Router();
 
-// ========== CHAT ROUTES ==========
+// ✅ Test route
+router.get("/", (req, res) => {
+  res.json({
+    success: true,
+    message: "Messages API is working!",
+    endpoints: {
+      chat: "/chat/*",
+      posts: "/posts/*",
+      notifications: "/notifications"
+    }
+  });
+});
+
+// ========== CHAT ROUTES (WORKING) ==========
 router.get("/chat/users", protectRoute, getUserForSidebar);
 router.get("/chat/conversations", protectRoute, getConversations);
 router.get("/chat/:id", protectRoute, getMessages);
 router.post("/chat/send/:id", protectRoute, sendMessage);
 
-// ========== POST ROUTES ==========
+// File uploads for chat
+router.post("/chat/upload-voice", protectRoute, uploadVoiceMessage);
+router.post("/chat/upload-image", protectRoute, uploadImageMessage);
+router.post("/chat/upload-file", protectRoute, uploadFileMessage);
+
+// ========== POST ROUTES (BASIC WORKING) ==========
 router.post("/posts/create", protectRoute, uploadPostMiddleware, createPost);
 router.get("/posts/feed", protectRoute, getFeedPosts);
-router.get("/posts/explore", protectRoute, getExplorePosts); // NEW
-router.get("/posts/search", protectRoute, searchPosts); // NEW
+router.get("/posts/explore", protectRoute, getExplorePosts);
 router.post("/posts/:postId/like", protectRoute, toggleLikePost);
-router.get("/posts/user/:username", protectRoute, getUserPosts);
-router.delete("/posts/:postId", protectRoute, deletePost); // NEW
 
-// ========== COMMENT ROUTES ==========
-router.post("/posts/:postId/comments", protectRoute, addComment); // NEW
-router.get("/posts/:postId/comments", protectRoute, getPostComments); // NEW
-router.delete("/posts/:postId/comments/:commentId", protectRoute, deleteComment); // NEW
+// ========== COMMENT ROUTES (BASIC WORKING) ==========
+router.post("/posts/:postId/comments", protectRoute, addComment);
+router.get("/posts/:postId/comments", protectRoute, getPostComments);
 
-// ========== NOTIFICATION ROUTES ==========
+// ========== NOTIFICATION ROUTES (WORKING) ==========
 router.get("/notifications", protectRoute, getNotifications);
-router.put("/notifications/:notificationId/read", protectRoute, (req, res) => { // NEW
-    // Add markAsRead function in controller
-    res.json({ success: true, message: "Notification marked as read" });
-});
-router.put("/notifications/read-all", protectRoute, (req, res) => { // NEW
-    // Add markAllAsRead function in controller
-    res.json({ success: true, message: "All notifications marked as read" });
-});
+
+// ========== DEBUG ROUTE ==========
+router.get("/debug/chat-data", protectRoute, debugChatData);
 
 export default router;

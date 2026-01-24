@@ -1,3 +1,4 @@
+// src/models/Post.model.js - UPDATED
 import mongoose from "mongoose";
 
 const postSchema = new mongoose.Schema(
@@ -59,7 +60,11 @@ const postSchema = new mongoose.Schema(
             default: false,
         },
     },
-    { timestamps: true }
+    { 
+        timestamps: true,
+        toJSON: { virtuals: true },
+        toObject: { virtuals: true }
+    }
 );
 
 // Indexes
@@ -77,6 +82,12 @@ postSchema.virtual("commentsCount").get(function () {
     return this.comments.length;
 });
 
-const Post = mongoose.model("Post", postSchema);
+// Virtual for saves count
+postSchema.virtual("savesCount").get(function () {
+    return this.saves.length;
+});
+
+// FIXED LINE 80: Check if model already exists
+const Post = mongoose.models.Post || mongoose.model("Post", postSchema);
 
 export default Post;

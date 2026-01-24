@@ -1,3 +1,4 @@
+// src/models/Comment.model.js
 import mongoose from "mongoose";
 
 const commentSchema = new mongoose.Schema(
@@ -49,6 +50,7 @@ commentSchema.index({ post: 1, createdAt: -1 });
 commentSchema.index({ reel: 1, createdAt: -1 });
 commentSchema.index({ user: 1 });
 
-const Comment = mongoose.model("Comment", commentSchema);
+// FIXED: Check if model already exists before creating
+const Comment = mongoose.models.Comment || mongoose.model("Comment", commentSchema);
 
 export default Comment;

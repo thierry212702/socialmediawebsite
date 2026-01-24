@@ -1,3 +1,4 @@
+// src/models/Notification.model.js
 import mongoose from "mongoose";
 
 const notificationSchema = new mongoose.Schema(
@@ -52,6 +53,7 @@ notificationSchema.index({ recipient: 1, createdAt: -1 });
 notificationSchema.index({ read: 1 });
 notificationSchema.index({ sender: 1 });
 
-const Notification = mongoose.model("Notification", notificationSchema);
+// FIXED: Use safe pattern to prevent "Cannot overwrite model" error
+const Notification = mongoose.models.Notification || mongoose.model("Notification", notificationSchema);
 
 export default Notification;

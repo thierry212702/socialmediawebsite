@@ -1,736 +1,1441 @@
-import cloudinary from "../lib/cloudinary.js";
+// controllers/message.controller.js - COMPLETE VERSION
+import mongoose from "mongoose";
 import Message from "../models/message.model.js";
+import Conversation from "../models/conversation.model.js";
 import User from "../models/user.model.js";
 import Post from "../models/Post.model.js";
-import Reel from "../models/Reel.model.js";
-import Comment from "../models/Comment.model.js";
-import Conversation from "../models/conversation.model.js";
-import Notification from "../models/Notification.model.js";
+import Notification from "../models/notification.model.js";
+import Comment from "../models/comment.model.js";
+import multer from "multer";
+import fs from "fs";
+import path from "path";
 
-// ==================== CHAT FUNCTIONS ====================
+// ========== HELPER FUNCTIONS ==========
+
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+    destination: function (req, file, cb) {
+        const uploadDir = "uploads/";
+        if (!fs.existsSync(uploadDir)) {
+            fs.mkdirSync(uploadDir, { recursive: true });
+        }
+        cb(null, uploadDir);
+    },
+    filename: function (req, file, cb) {
+        const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+        const ext = path.extname(file.originalname);
+        cb(null, file.fieldname + "-" + uniqueSuffix + ext);
+    },
+});
+
+const upload = multer({
+    storage: storage,
+    limits: {
+        fileSize: 25 * 1024 * 1024,
+    },
+    fileFilter: (req, file, cb) => {
+        const allowedTypes = /jpeg|jpg|png|gif|webp|mp4|webm|avi|mov|mp3|wav|ogg|pdf|doc|docx|txt/;
+        const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+        const mimetype = allowedTypes.test(file.mimetype);
+
+        if (mimetype && extname) {
+            return cb(null, true);
+        } else {
+            cb(new Error("File type not allowed!"));
+        }
+    },
+});
+
+// Helper to check if string is valid ObjectId
+const isValidObjectId = (id) => {
+    return mongoose.Types.ObjectId.isValid(id);
+};
+
+// Helper function for message type text
+const getMessageTypeText = (type) => {
+    switch(type) {
+        case 'image': return '📷 Image';
+        case 'voice': return '🎤 Voice message';
+        case 'video': return '🎥 Video';
+        case 'file': return '📎 File';
+        default: return 'Message';
+    }
+};
+
+// ========== CHAT CONTROLLERS ==========
+
+// Get users for sidebar
 export const getUserForSidebar = async (req, res) => {
-  try {
-    const loggedInUserId = req.user._id;
-    const filteredUsers = await User.find({ _id: { $ne: loggedInUserId } }).select("-password");
+    try {
+        const loggedInUserId = req.user._id;
 
-    res.status(200).json({
-      success: true,
-      users: filteredUsers,
-    });
-  } catch (error) {
-    console.error("Error in getUserForSidebar:", error.message);
-    res.status(500).json({
-      success: false,
-      error: "Internal server error",
-    });
-  }
+        // Get all users except the logged-in user
+        const allUsers = await User.find({
+            _id: { $ne: loggedInUserId },
+        }).select("-password").lean();
+
+        // Get the last message with each user
+        const usersWithChatInfo = await Promise.all(
+            allUsers.map(async (user) => {
+                try {
+                    // Get last message between logged in user and this user
+                    const lastMessage = await Message.findOne({
+                        $or: [
+                            { senderId: loggedInUserId, receiverId: user._id },
+                            { senderId: user._id, receiverId: loggedInUserId }
+                        ]
+                    })
+                    .sort({ createdAt: -1 })
+                    .lean();
+
+                    // Get unread message count
+                    const unreadCount = await Message.countDocuments({
+                        senderId: user._id,
+                        receiverId: loggedInUserId,
+                        read: false
+                    });
+
+                    // Get following status
+                    const loggedInUser = await User.findById(loggedInUserId).select("following").lean();
+                    const isFollowing = loggedInUser?.following?.includes(user._id.toString()) || false;
+
+                    return {
+                        _id: user._id.toString(),
+                        username: user.username,
+                        name: user.name || user.username,
+                        email: user.email,
+                        profilePicture: user.profilePicture || `https://ui-avatars.com/api/?name=${user.username}&background=random&color=fff`,
+                        bio: user.bio || "",
+                        lastMessage: lastMessage ? {
+                            text: lastMessage.text || `${lastMessage.messageType} message`,
+                            messageType: lastMessage.messageType,
+                            createdAt: lastMessage.createdAt,
+                            senderId: lastMessage.senderId
+                        } : null,
+                        unreadCount: unreadCount || 0,
+                        isOnline: false,
+                        isFollowing,
+                        hasConversation: !!lastMessage,
+                        lastActive: user.lastActive || user.updatedAt || user.createdAt
+                    };
+                } catch (err) {
+                    console.error(`Error processing user ${user._id}:`, err);
+                    return {
+                        _id: user._id.toString(),
+                        username: user.username,
+                        name: user.name || user.username,
+                        profilePicture: user.profilePicture,
+                        error: "Error loading chat data"
+                    };
+                }
+            })
+        );
+
+        // Sort users
+        const sortedUsers = usersWithChatInfo.sort((a, b) => {
+            if (a.lastMessage && b.lastMessage) {
+                return new Date(b.lastMessage.createdAt) - new Date(a.lastMessage.createdAt);
+            }
+            if (a.lastMessage && !b.lastMessage) return -1;
+            if (!a.lastMessage && b.lastMessage) return 1;
+            return a.username.localeCompare(b.username);
+        });
+
+        res.status(200).json({
+            success: true,
+            users: sortedUsers,
+            total: sortedUsers.length
+        });
+
+    } catch (error) {
+        console.error("Error in getUserForSidebar:", error.message);
+        res.status(500).json({ 
+            success: false,
+            error: "Internal server error",
+            users: []
+        });
+    }
 };
 
-// ==================== NEW POST FUNCTIONS ====================
+// Get conversations - FIXED unreadCount issue
+export const getConversations = async (req, res) => {
+    try {
+        const userId = req.user._id;
 
-// Add comment to post
-export const addComment = async (req, res) => {
-  try {
-    const { postId } = req.params;
-    const { content } = req.body;
-    const userId = req.user._id;
+        // Find conversations where user is a participant
+        const conversations = await Conversation.find({
+            participants: userId,
+        })
+        .populate({
+            path: "participants",
+            match: { _id: { $ne: userId } },
+            select: "username profilePicture name email"
+        })
+        .populate({
+            path: "lastMessage",
+            select: "text messageType createdAt read senderId"
+        })
+        .sort({ updatedAt: -1 })
+        .lean();
 
-    if (!content || content.trim() === '') {
-      return res.status(400).json({
-        success: false,
-        error: "Comment content is required"
-      });
+        // Filter and enhance conversations
+        const enhancedConversations = await Promise.all(
+            conversations.map(async (convo) => {
+                try {
+                    const otherUser = convo.participants?.[0];
+                    if (!otherUser) return null;
+
+                    // Get unread count - FIXED: Handle both Map and object formats
+                    let unreadCount = 0;
+                    if (convo.unreadCount) {
+                        if (convo.unreadCount instanceof Map || convo.unreadCount.constructor.name === 'Map') {
+                            unreadCount = convo.unreadCount.get(userId.toString()) || 0;
+                        } else if (typeof convo.unreadCount === 'object') {
+                            unreadCount = convo.unreadCount[userId.toString()] || 0;
+                        }
+                    }
+
+                    // Also count unread messages from database
+                    const dbUnreadCount = await Message.countDocuments({
+                        senderId: otherUser._id,
+                        receiverId: userId,
+                        read: false
+                    });
+
+                    unreadCount = Math.max(unreadCount, dbUnreadCount);
+
+                    return {
+                        _id: convo._id.toString(),
+                        user: {
+                            _id: otherUser._id.toString(),
+                            username: otherUser.username,
+                            name: otherUser.name || otherUser.username,
+                            profilePicture: otherUser.profilePicture || `https://ui-avatars.com/api/?name=${otherUser.username}`,
+                            email: otherUser.email
+                        },
+                        lastMessage: convo.lastMessage ? {
+                            text: convo.lastMessage.text || `${convo.lastMessage.messageType} message`,
+                            messageType: convo.lastMessage.messageType,
+                            createdAt: convo.lastMessage.createdAt,
+                            read: convo.lastMessage.read,
+                            isSentByMe: convo.lastMessage.senderId?.toString() === userId.toString()
+                        } : null,
+                        unreadCount,
+                        updatedAt: convo.updatedAt,
+                        createdAt: convo.createdAt
+                    };
+                } catch (err) {
+                    console.error("Error enhancing conversation:", err);
+                    return null;
+                }
+            })
+        );
+
+        // Filter out null values and sort
+        const validConversations = enhancedConversations.filter(conv => conv !== null);
+        const sortedConversations = validConversations.sort((a, b) => {
+            const timeA = a.lastMessage?.createdAt || a.updatedAt;
+            const timeB = b.lastMessage?.createdAt || b.updatedAt;
+            return new Date(timeB) - new Date(timeA);
+        });
+
+        res.status(200).json({
+            success: true,
+            conversations: sortedConversations,
+            total: sortedConversations.length
+        });
+
+    } catch (error) {
+        console.error("Error in getConversations:", error.message);
+        res.status(500).json({ 
+            success: false,
+            error: "Internal server error",
+            conversations: []
+        });
     }
-
-    // Create comment
-    const comment = new Comment({
-      user: userId,
-      post: postId,
-      content: content.trim()
-    });
-
-    await comment.save();
-
-    // Add comment to post
-    const post = await Post.findById(postId);
-    if (!post) {
-      return res.status(404).json({
-        success: false,
-        error: "Post not found"
-      });
-    }
-
-    post.comments.push(comment._id);
-    await post.save();
-
-    // Create notification if not commenting on own post
-    if (post.user.toString() !== userId.toString()) {
-      await Notification.create({
-        recipient: post.user,
-        sender: userId,
-        type: "comment",
-        post: postId,
-        comment: comment._id
-      });
-    }
-
-    // Populate comment with user info
-    const populatedComment = await Comment.findById(comment._id)
-      .populate("user", "username fullName profilePicture");
-
-    res.status(201).json({
-      success: true,
-      comment: populatedComment,
-      message: "Comment added successfully"
-    });
-  } catch (error) {
-    console.error("Add comment error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to add comment"
-    });
-  }
 };
 
-// Get post comments
-export const getPostComments = async (req, res) => {
-  try {
-    const { postId } = req.params;
-    const { limit = 20, skip = 0 } = req.query;
+// Get messages for a conversation - FIXED ObjectId issue
+export const getMessages = async (req, res) => {
+    try {
+        const { id: userToChatId } = req.params;
+        const userId = req.user._id;
 
-    const comments = await Comment.find({ post: postId })
-      .populate("user", "username fullName profilePicture")
-      .populate("replies")
-      .sort({ createdAt: -1 })
-      .skip(parseInt(skip))
-      .limit(parseInt(limit));
+        // Validate userToChatId
+        if (!isValidObjectId(userToChatId)) {
+            return res.status(400).json({
+                success: false,
+                error: "Invalid user ID format"
+            });
+        }
 
-    res.json({
-      success: true,
-      comments,
-      total: await Comment.countDocuments({ post: postId })
-    });
-  } catch (error) {
-    console.error("Get comments error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to get comments"
-    });
-  }
+        // Check if other user exists
+        const otherUser = await User.findById(userToChatId);
+        if (!otherUser) {
+            return res.status(404).json({
+                success: false,
+                error: "User not found"
+            });
+        }
+
+        // Get messages between the two users
+        const messages = await Message.find({
+            $or: [
+                { senderId: userId, receiverId: userToChatId },
+                { senderId: userToChatId, receiverId: userId },
+            ],
+        })
+            .populate("senderId", "username profilePicture name")
+            .populate("receiverId", "username profilePicture name")
+            .sort({ createdAt: 1 })
+            .lean();
+
+        // Mark messages as read
+        if (messages.length > 0) {
+            await Message.updateMany(
+                {
+                    senderId: userToChatId,
+                    receiverId: userId,
+                    read: false,
+                },
+                { $set: { read: true, readAt: new Date() } }
+            );
+        }
+
+        // Format messages
+        const formattedMessages = messages.map(msg => ({
+            _id: msg._id.toString(),
+            text: msg.text || getMessageTypeText(msg.messageType),
+            senderId: msg.senderId?._id?.toString(),
+            receiverId: msg.receiverId?._id?.toString(),
+            sender: {
+                _id: msg.senderId?._id?.toString(),
+                username: msg.senderId?.username,
+                name: msg.senderId?.name || msg.senderId?.username,
+                profilePicture: msg.senderId?.profilePicture
+            },
+            receiver: {
+                _id: msg.receiverId?._id?.toString(),
+                username: msg.receiverId?.username,
+                name: msg.receiverId?.name || msg.receiverId?.username,
+                profilePicture: msg.receiverId?.profilePicture
+            },
+            messageType: msg.messageType,
+            read: msg.read,
+            createdAt: msg.createdAt,
+            updatedAt: msg.updatedAt,
+            ...(msg.image && { image: msg.image }),
+            ...(msg.voiceMessage && { voiceMessage: msg.voiceMessage }),
+            ...(msg.file && { file: msg.file })
+        }));
+
+        // Get or create conversation
+        let conversation = await Conversation.findOne({
+            participants: { $all: [userId, userToChatId] },
+        });
+
+        if (!conversation && messages.length > 0) {
+            conversation = new Conversation({
+                participants: [userId, userToChatId],
+                lastMessage: messages[messages.length - 1]._id,
+                unreadCount: {}
+            });
+            conversation.unreadCount[userToChatId] = 0;
+            conversation.unreadCount[userId] = 0;
+            await conversation.save();
+        }
+
+        // Update conversation unread count
+        if (conversation) {
+            conversation.unreadCount = conversation.unreadCount || {};
+            conversation.unreadCount[userId] = 0;
+            conversation.updatedAt = new Date();
+            await conversation.save();
+        }
+
+        res.status(200).json({
+            success: true,
+            messages: formattedMessages,
+            otherUser: {
+                _id: otherUser._id.toString(),
+                username: otherUser.username,
+                name: otherUser.name || otherUser.username,
+                profilePicture: otherUser.profilePicture,
+                bio: otherUser.bio || "",
+                isOnline: false
+            },
+            conversationId: conversation?._id?.toString(),
+            total: formattedMessages.length
+        });
+
+    } catch (error) {
+        console.error("Error in getMessages:", error.message);
+        res.status(500).json({ 
+            success: false,
+            error: "Internal server error",
+            messages: []
+        });
+    }
 };
 
-// Delete comment
-export const deleteComment = async (req, res) => {
-  try {
-    const { postId, commentId } = req.params;
-    const userId = req.user._id;
+// Send message
+export const sendMessage = async (req, res) => {
+    try {
+        const { id: receiverId } = req.params;
+        const { text, messageType = "text" } = req.body;
+        const senderId = req.user._id;
 
-    const comment = await Comment.findById(commentId);
-    if (!comment) {
-      return res.status(404).json({
-        success: false,
-        error: "Comment not found"
-      });
+        // Validate
+        if (!receiverId || !isValidObjectId(receiverId)) {
+            return res.status(400).json({ 
+                success: false,
+                error: "Valid receiver ID is required" 
+            });
+        }
+
+        if (messageType === "text" && (!text?.trim())) {
+            return res.status(400).json({ 
+                success: false,
+                error: "Message text is required" 
+            });
+        }
+
+        // Check if receiver exists
+        const receiver = await User.findById(receiverId);
+        if (!receiver) {
+            return res.status(404).json({ 
+                success: false,
+                error: "User not found" 
+            });
+        }
+
+        // Create message
+        const messageData = {
+            senderId,
+            receiverId,
+            messageType,
+            ...(messageType === "text" && { text: text.trim() })
+        };
+
+        const newMessage = new Message(messageData);
+        await newMessage.save();
+
+        // Find or create conversation - FIXED: Use object instead of Map
+        let conversation = await Conversation.findOne({
+            participants: { $all: [senderId, receiverId] },
+        });
+
+        if (!conversation) {
+            conversation = new Conversation({
+                participants: [senderId, receiverId],
+                unreadCount: {}
+            });
+            conversation.unreadCount[receiverId.toString()] = 1;
+            conversation.unreadCount[senderId.toString()] = 0;
+        } else {
+            // Initialize unreadCount if it doesn't exist
+            conversation.unreadCount = conversation.unreadCount || {};
+            // Increment unread count for receiver
+            const currentUnread = conversation.unreadCount[receiverId.toString()] || 0;
+            conversation.unreadCount[receiverId.toString()] = currentUnread + 1;
+        }
+
+        conversation.lastMessage = newMessage._id;
+        conversation.updatedAt = new Date();
+        await conversation.save();
+
+        // Populate message
+        const populatedMessage = await Message.findById(newMessage._id)
+            .populate("senderId", "username profilePicture name")
+            .populate("receiverId", "username profilePicture name");
+
+        // Create notification
+        const notification = new Notification({
+            recipient: receiverId,
+            sender: senderId,
+            type: "message",
+            message: `New message from ${req.user.username}`,
+            relatedId: newMessage._id
+        });
+        await notification.save();
+
+        // Format response
+        const formattedMessage = {
+            _id: populatedMessage._id.toString(),
+            text: populatedMessage.text || getMessageTypeText(populatedMessage.messageType),
+            senderId: populatedMessage.senderId._id.toString(),
+            receiverId: populatedMessage.receiverId._id.toString(),
+            sender: {
+                _id: populatedMessage.senderId._id.toString(),
+                username: populatedMessage.senderId.username,
+                name: populatedMessage.senderId.name || populatedMessage.senderId.username,
+                profilePicture: populatedMessage.senderId.profilePicture
+            },
+            receiver: {
+                _id: populatedMessage.receiverId._id.toString(),
+                username: populatedMessage.receiverId.username,
+                name: populatedMessage.receiverId.name || populatedMessage.receiverId.username,
+                profilePicture: populatedMessage.receiverId.profilePicture
+            },
+            messageType: populatedMessage.messageType,
+            read: populatedMessage.read,
+            createdAt: populatedMessage.createdAt,
+            updatedAt: populatedMessage.updatedAt
+        };
+
+        // Emit socket event if socket.io is available
+        if (req.app.get('io')) {
+            req.app.get('io').to(receiverId.toString()).emit('newMessage', formattedMessage);
+        }
+
+        res.status(201).json({
+            success: true,
+            message: "Message sent successfully",
+            data: formattedMessage,
+            conversationId: conversation._id.toString()
+        });
+
+    } catch (error) {
+        console.error("Error in sendMessage:", error.message);
+        res.status(500).json({ 
+            success: false,
+            error: "Internal server error" 
+        });
     }
+};
 
-    // Check if user owns the comment or is post owner
-    const post = await Post.findById(postId);
-    if (comment.user.toString() !== userId.toString() &&
-      post.user.toString() !== userId.toString()) {
-      return res.status(403).json({
-        success: false,
-        error: "Not authorized to delete this comment"
-      });
+// ========== FILE UPLOAD CONTROLLERS ==========
+
+// Upload voice message
+export const uploadVoiceMessage = async (req, res) => {
+    try {
+        const { receiverId, duration } = req.body;
+        const voiceFile = req.file;
+        const senderId = req.user._id;
+
+        if (!voiceFile) {
+            return res.status(400).json({ 
+                success: false,
+                error: "No voice file uploaded" 
+            });
+        }
+
+        if (!receiverId || !isValidObjectId(receiverId)) {
+            return res.status(400).json({ 
+                success: false,
+                error: "Valid receiver ID is required" 
+            });
+        }
+
+        // Check if receiver exists
+        const receiver = await User.findById(receiverId);
+        if (!receiver) {
+            return res.status(404).json({ 
+                success: false,
+                error: "User not found" 
+            });
+        }
+
+        // Create message with voice
+        const message = new Message({
+            senderId,
+            receiverId,
+            messageType: "voice",
+            voiceMessage: {
+                url: `/uploads/${voiceFile.filename}`,
+                duration: parseInt(duration) || 0,
+                filename: voiceFile.filename,
+            },
+        });
+
+        await message.save();
+
+        // Update conversation
+        let conversation = await Conversation.findOne({
+            participants: { $all: [senderId, receiverId] },
+        });
+
+        if (!conversation) {
+            conversation = new Conversation({
+                participants: [senderId, receiverId],
+                unreadCount: {}
+            });
+            conversation.unreadCount[receiverId.toString()] = 1;
+            conversation.unreadCount[senderId.toString()] = 0;
+        } else {
+            conversation.unreadCount = conversation.unreadCount || {};
+            const currentUnread = conversation.unreadCount[receiverId.toString()] || 0;
+            conversation.unreadCount[receiverId.toString()] = currentUnread + 1;
+        }
+
+        conversation.lastMessage = message._id;
+        conversation.updatedAt = new Date();
+        await conversation.save();
+
+        // Create notification
+        const notification = new Notification({
+            recipient: receiverId,
+            sender: senderId,
+            type: "message",
+            message: "Sent a voice message",
+            relatedId: message._id
+        });
+        await notification.save();
+
+        // Populate message
+        const populatedMessage = await Message.findById(message._id)
+            .populate("senderId", "username profilePicture name")
+            .populate("receiverId", "username profilePicture name");
+
+        res.status(200).json({
+            success: true,
+            message: "Voice message sent successfully",
+            data: {
+                _id: populatedMessage._id.toString(),
+                messageType: "voice",
+                voiceMessage: populatedMessage.voiceMessage,
+                sender: populatedMessage.senderId,
+                receiver: populatedMessage.receiverId,
+                createdAt: populatedMessage.createdAt
+            },
+            conversationId: conversation._id.toString()
+        });
+    } catch (error) {
+        console.error("Error uploading voice message:", error);
+        res.status(500).json({ 
+            success: false,
+            error: "Failed to upload voice message" 
+        });
     }
+};
 
-    // Remove comment from post
-    await Post.findByIdAndUpdate(postId, {
-      $pull: { comments: commentId }
-    });
+// Upload image message
+export const uploadImageMessage = async (req, res) => {
+    try {
+        const { receiverId } = req.body;
+        const imageFile = req.file;
+        const senderId = req.user._id;
 
-    // Delete the comment
-    await Comment.findByIdAndDelete(commentId);
+        if (!imageFile) {
+            return res.status(400).json({ 
+                success: false,
+                error: "No image file uploaded" 
+            });
+        }
 
-    res.json({
-      success: true,
-      message: "Comment deleted successfully"
-    });
-  } catch (error) {
-    console.error("Delete comment error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to delete comment"
-    });
-  }
+        if (!receiverId || !isValidObjectId(receiverId)) {
+            return res.status(400).json({ 
+                success: false,
+                error: "Valid receiver ID is required" 
+            });
+        }
+
+        // Check if receiver exists
+        const receiver = await User.findById(receiverId);
+        if (!receiver) {
+            return res.status(404).json({ 
+                success: false,
+                error: "User not found" 
+            });
+        }
+
+        const message = new Message({
+            senderId,
+            receiverId,
+            messageType: "image",
+            image: {
+                url: `/uploads/${imageFile.filename}`,
+                filename: imageFile.filename,
+                size: imageFile.size,
+                mimetype: imageFile.mimetype
+            },
+        });
+
+        await message.save();
+
+        // Update conversation
+        let conversation = await Conversation.findOne({
+            participants: { $all: [senderId, receiverId] },
+        });
+
+        if (!conversation) {
+            conversation = new Conversation({
+                participants: [senderId, receiverId],
+                unreadCount: {}
+            });
+            conversation.unreadCount[receiverId.toString()] = 1;
+            conversation.unreadCount[senderId.toString()] = 0;
+        } else {
+            conversation.unreadCount = conversation.unreadCount || {};
+            const currentUnread = conversation.unreadCount[receiverId.toString()] || 0;
+            conversation.unreadCount[receiverId.toString()] = currentUnread + 1;
+        }
+
+        conversation.lastMessage = message._id;
+        conversation.updatedAt = new Date();
+        await conversation.save();
+
+        // Create notification
+        const notification = new Notification({
+            recipient: receiverId,
+            sender: senderId,
+            type: "message",
+            message: "Sent an image",
+            relatedId: message._id
+        });
+        await notification.save();
+
+        // Populate message
+        const populatedMessage = await Message.findById(message._id)
+            .populate("senderId", "username profilePicture name")
+            .populate("receiverId", "username profilePicture name");
+
+        res.status(200).json({
+            success: true,
+            message: "Image sent successfully",
+            data: {
+                _id: populatedMessage._id.toString(),
+                messageType: "image",
+                image: populatedMessage.image,
+                sender: populatedMessage.senderId,
+                receiver: populatedMessage.receiverId,
+                createdAt: populatedMessage.createdAt
+            },
+            conversationId: conversation._id.toString()
+        });
+    } catch (error) {
+        console.error("Error uploading image:", error);
+        res.status(500).json({ 
+            success: false,
+            error: "Failed to upload image" 
+        });
+    }
+};
+
+// Upload file message
+export const uploadFileMessage = async (req, res) => {
+    try {
+        const { receiverId } = req.body;
+        const file = req.file;
+        const senderId = req.user._id;
+
+        if (!file) {
+            return res.status(400).json({ 
+                success: false,
+                error: "No file uploaded" 
+            });
+        }
+
+        if (!receiverId || !isValidObjectId(receiverId)) {
+            return res.status(400).json({ 
+                success: false,
+                error: "Valid receiver ID is required" 
+            });
+        }
+
+        // Check if receiver exists
+        const receiver = await User.findById(receiverId);
+        if (!receiver) {
+            return res.status(404).json({ 
+                success: false,
+                error: "User not found" 
+            });
+        }
+
+        // Determine file type
+        let messageType = "file";
+        if (file.mimetype.startsWith("video/")) {
+            messageType = "video";
+        } else if (file.mimetype.startsWith("audio/") && !file.mimetype.includes("voice")) {
+            messageType = "audio";
+        } else if (file.mimetype.startsWith("image/")) {
+            messageType = "image";
+        }
+
+        const message = new Message({
+            senderId,
+            receiverId,
+            messageType,
+            file: {
+                url: `/uploads/${file.filename}`,
+                filename: file.filename,
+                type: file.mimetype,
+                size: file.size,
+            },
+        });
+
+        await message.save();
+
+        // Update conversation
+        let conversation = await Conversation.findOne({
+            participants: { $all: [senderId, receiverId] },
+        });
+
+        if (!conversation) {
+            conversation = new Conversation({
+                participants: [senderId, receiverId],
+                unreadCount: {}
+            });
+            conversation.unreadCount[receiverId.toString()] = 1;
+            conversation.unreadCount[senderId.toString()] = 0;
+        } else {
+            conversation.unreadCount = conversation.unreadCount || {};
+            const currentUnread = conversation.unreadCount[receiverId.toString()] || 0;
+            conversation.unreadCount[receiverId.toString()] = currentUnread + 1;
+        }
+
+        conversation.lastMessage = message._id;
+        conversation.updatedAt = new Date();
+        await conversation.save();
+
+        // Create notification
+        const notification = new Notification({
+            recipient: receiverId,
+            sender: senderId,
+            type: "message",
+            message: `Sent a ${messageType}`,
+            relatedId: message._id
+        });
+        await notification.save();
+
+        // Populate message
+        const populatedMessage = await Message.findById(message._id)
+            .populate("senderId", "username profilePicture name")
+            .populate("receiverId", "username profilePicture name");
+
+        res.status(200).json({
+            success: true,
+            message: "File sent successfully",
+            data: {
+                _id: populatedMessage._id.toString(),
+                messageType,
+                file: populatedMessage.file,
+                sender: populatedMessage.senderId,
+                receiver: populatedMessage.receiverId,
+                createdAt: populatedMessage.createdAt
+            },
+            conversationId: conversation._id.toString()
+        });
+    } catch (error) {
+        console.error("Error uploading file:", error);
+        res.status(500).json({ 
+            success: false,
+            error: "Failed to upload file" 
+        });
+    }
+};
+
+// ========== POST CONTROLLERS ==========
+
+// Create post
+export const createPost = async (req, res) => {
+    try {
+        const { caption } = req.body;
+        const userId = req.user._id;
+
+        let imageUrl = null;
+        if (req.file) {
+            imageUrl = `/uploads/${req.file.filename}`;
+        }
+
+        const newPost = new Post({
+            user: userId,
+            caption,
+            image: imageUrl,
+        });
+
+        await newPost.save();
+
+        // Populate user info
+        const populatedPost = await Post.findById(newPost._id).populate(
+            "user",
+            "username profilePicture name"
+        );
+
+        res.status(201).json({
+            success: true,
+            post: populatedPost
+        });
+    } catch (error) {
+        console.error("Error in createPost:", error.message);
+        res.status(500).json({ 
+            success: false,
+            error: "Internal server error" 
+        });
+    }
+};
+
+// Get feed posts
+export const getFeedPosts = async (req, res) => {
+    try {
+        const userId = req.user._id;
+
+        // Get user's following list
+        const user = await User.findById(userId);
+        const followingIds = [...(user.following || []), userId];
+
+        const posts = await Post.find({ user: { $in: followingIds } })
+            .populate("user", "username profilePicture name")
+            .populate({
+                path: "comments",
+                populate: {
+                    path: "user",
+                    select: "username profilePicture",
+                },
+                options: { sort: { createdAt: -1 }, limit: 2 },
+            })
+            .sort({ createdAt: -1 })
+            .lean();
+
+        // Add like status for current user
+        const postsWithLikeStatus = posts.map(post => ({
+            ...post,
+            isLiked: post.likes?.includes(userId.toString()) || false,
+            likesCount: post.likes?.length || 0,
+            commentsCount: post.comments?.length || 0
+        }));
+
+        res.status(200).json({
+            success: true,
+            posts: postsWithLikeStatus,
+            total: postsWithLikeStatus.length
+        });
+    } catch (error) {
+        console.error("Error in getFeedPosts:", error.message);
+        res.status(500).json({ 
+            success: false,
+            error: "Internal server error",
+            posts: []
+        });
+    }
 };
 
 // Get explore posts
 export const getExplorePosts = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const { page = 1, limit = 20 } = req.query;
-    const skip = (page - 1) * limit;
+    try {
+        const userId = req.user._id;
 
-    // Get posts from users not followed by current user
-    const user = await User.findById(userId).select("following");
-    const followingIds = user.following;
+        const posts = await Post.find()
+            .populate("user", "username profilePicture name")
+            .sort({ likes: -1, createdAt: -1 })
+            .limit(50)
+            .lean();
 
-    const posts = await Post.find({
-      user: { $nin: [...followingIds, userId] }, // Exclude followed users and self
-      isArchived: false
-    })
-      .populate("user", "username fullName profilePicture verified")
-      .sort({ likes: -1, createdAt: -1 }) // Popular first
-      .skip(skip)
-      .limit(parseInt(limit));
+        // Add like status for current user
+        const postsWithLikeStatus = posts.map(post => ({
+            ...post,
+            isLiked: post.likes?.includes(userId.toString()) || false,
+            likesCount: post.likes?.length || 0,
+            commentsCount: post.comments?.length || 0
+        }));
 
-    res.json({
-      success: true,
-      posts,
-      total: posts.length,
-      page: parseInt(page),
-      limit: parseInt(limit)
-    });
-  } catch (error) {
-    console.error("Get explore posts error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to get explore posts"
-    });
-  }
-};
-
-// Search posts
-export const searchPosts = async (req, res) => {
-  try {
-    const { q: query } = req.query;
-    const { page = 1, limit = 20 } = req.query;
-    const skip = (page - 1) * limit;
-
-    if (!query || query.trim() === '') {
-      return res.json({
-        success: true,
-        posts: [],
-        total: 0
-      });
-    }
-
-    const posts = await Post.find({
-      $or: [
-        { caption: { $regex: query, $options: "i" } },
-        { tags: { $regex: query, $options: "i" } }
-      ],
-      isArchived: false
-    })
-      .populate("user", "username fullName profilePicture verified")
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(parseInt(limit));
-
-    res.json({
-      success: true,
-      posts,
-      total: await Post.countDocuments({
-        $or: [
-          { caption: { $regex: query, $options: "i" } },
-          { tags: { $regex: query, $options: "i" } }
-        ],
-        isArchived: false
-      })
-    });
-  } catch (error) {
-    console.error("Search posts error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to search posts"
-    });
-  }
-};
-
-// Delete post
-export const deletePost = async (req, res) => {
-  try {
-    const { postId } = req.params;
-    const userId = req.user._id;
-
-    const post = await Post.findById(postId);
-    if (!post) {
-      return res.status(404).json({
-        success: false,
-        error: "Post not found"
-      });
-    }
-
-    // Check if user owns the post
-    if (post.user.toString() !== userId.toString()) {
-      return res.status(403).json({
-        success: false,
-        error: "Not authorized to delete this post"
-      });
-    }
-
-    // Delete post media from Cloudinary
-    for (const mediaUrl of post.media) {
-      try {
-        const publicId = mediaUrl.split('/').pop().split('.')[0];
-        await cloudinary.uploader.destroy(`posts/${publicId}`, {
-          resource_type: post.mediaType === 'video' ? 'video' : 'image'
+        res.status(200).json({
+            success: true,
+            posts: postsWithLikeStatus,
+            total: postsWithLikeStatus.length
         });
-      } catch (error) {
-        console.warn(`Could not delete media ${mediaUrl}:`, error.message);
-      }
-    }
-
-    // Delete the post
-    await Post.findByIdAndDelete(postId);
-
-    // Remove from user's posts
-    await User.findByIdAndUpdate(userId, {
-      $pull: { posts: postId }
-    });
-
-    // Delete associated comments
-    await Comment.deleteMany({ post: postId });
-
-    // Delete associated notifications
-    await Notification.deleteMany({ post: postId });
-
-    res.json({
-      success: true,
-      message: "Post deleted successfully"
-    });
-  } catch (error) {
-    console.error("Delete post error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to delete post"
-    });
-  }
-};
-
-export const getMessages = async (req, res) => {
-  try {
-    const { id: userToChatId } = req.params;
-    const myId = req.user._id;
-
-    const messages = await Message.find({
-      $or: [
-        { senderId: myId, receiverId: userToChatId },
-        { senderId: userToChatId, receiverId: myId },
-      ],
-    })
-      .populate("senderId", "username fullName profilePicture")
-      .populate("receiverId", "username fullName profilePicture")
-      .sort({ createdAt: 1 });
-
-    res.status(200).json({
-      success: true,
-      messages,
-    });
-  } catch (error) {
-    console.log("Error in getting message:", error.message);
-    res.status(500).json({
-      success: false,
-      message: "Internal server error",
-    });
-  }
-};
-
-export const sendMessage = async (req, res) => {
-  try {
-    const { text, image } = req.body;
-    const { id: receiverId } = req.params;
-    const senderId = req.user._id;
-
-    // Validate input
-    if (!text && !image) {
-      return res.status(400).json({
-        success: false,
-        error: "Message text or image is required",
-      });
-    }
-
-    let imageUrl;
-    if (image) {
-      try {
-        const uploadResponse = await cloudinary.uploader.upload(image, {
-          folder: "messages",
+    } catch (error) {
+        console.error("Error in getExplorePosts:", error.message);
+        res.status(500).json({ 
+            success: false,
+            error: "Internal server error",
+            posts: []
         });
-        imageUrl = uploadResponse.secure_url;
-      } catch (error) {
-        console.error("Image upload error:", error);
-        return res.status(500).json({
-          success: false,
-          error: "Failed to upload image",
-        });
-      }
     }
-
-    // Create message
-    const newMessage = new Message({
-      senderId,
-      receiverId,
-      text,
-      image: imageUrl,
-    });
-
-    await newMessage.save();
-
-    // Find or create conversation
-    let conversation = await Conversation.findOne({
-      participants: { $all: [senderId, receiverId] },
-    });
-
-    if (!conversation) {
-      conversation = new Conversation({
-        participants: [senderId, receiverId],
-        lastMessage: newMessage._id,
-        unreadCount: new Map([[receiverId, 1]]),
-      });
-    } else {
-      conversation.lastMessage = newMessage._id;
-      // Increment unread count for receiver
-      const currentUnread = conversation.unreadCount.get(receiverId) || 0;
-      conversation.unreadCount.set(receiverId, currentUnread + 1);
-    }
-
-    await conversation.save();
-
-    // Populate message
-    const populatedMessage = await Message.findById(newMessage._id)
-      .populate("senderId", "username fullName profilePicture")
-      .populate("receiverId", "username fullName profilePicture");
-
-    res.status(201).json({
-      success: true,
-      message: populatedMessage,
-      conversationId: conversation._id,
-    });
-  } catch (error) {
-    console.log("Error in sendMessage:", error.message);
-    res.status(500).json({
-      success: false,
-      error: "Failed to send message",
-    });
-  }
 };
 
-export const getConversations = async (req, res) => {
-  try {
-    const userId = req.user._id;
-
-    const conversations = await Conversation.find({
-      participants: userId,
-    })
-      .populate({
-        path: "participants",
-        select: "username fullName profilePicture status",
-        match: { _id: { $ne: userId } },
-      })
-      .populate("lastMessage")
-      .sort({ updatedAt: -1 });
-
-    res.status(200).json({
-      success: true,
-      conversations,
-    });
-  } catch (error) {
-    console.log("Error in getConversations:", error.message);
-    res.status(500).json({
-      success: false,
-      message: "Internal server error",
-    });
-  }
-};
-
-// ==================== POST FUNCTIONS ====================
-export const createPost = async (req, res) => {
-  try {
-    const { caption, location, tags } = req.body;
-    const files = req.files || [];
-    const userId = req.user._id;
-
-    if (files.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: "No media uploaded",
-      });
-    }
-
-    // Upload media to Cloudinary
-    const mediaUrls = [];
-    for (const file of files) {
-      const result = await cloudinary.uploader.upload(file.path, {
-        folder: "posts",
-        resource_type: file.mimetype.startsWith("video") ? "video" : "image",
-      });
-      mediaUrls.push(result.secure_url);
-    }
-
-    // Determine media type
-    let mediaType = "image";
-    if (files.length > 1) {
-      mediaType = "carousel";
-    } else if (files[0].mimetype.startsWith("video")) {
-      mediaType = "video";
-    }
-
-    // Create post
-    const post = new Post({
-      user: userId,
-      caption,
-      media: mediaUrls,
-      mediaType,
-      location,
-      tags: tags ? tags.split(",").map((tag) => tag.trim()) : [],
-    });
-
-    await post.save();
-
-    // Add post to user's posts
-    await User.findByIdAndUpdate(userId, {
-      $push: { posts: post._id },
-    });
-
-    // Populate user details
-    const populatedPost = await Post.findById(post._id).populate(
-      "user",
-      "username fullName profilePicture verified"
-    );
-
-    res.status(201).json({
-      success: true,
-      post: populatedPost,
-      message: "Post created successfully",
-    });
-  } catch (error) {
-    console.error("Create post error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to create post",
-    });
-  }
-};
-
-export const getFeedPosts = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const { page = 1, limit = 10 } = req.query;
-    const skip = (page - 1) * limit;
-
-    // Get users that current user follows
-    const user = await User.findById(userId).select("following");
-    const followingIds = [...user.following, userId];
-
-    const posts = await Post.find({
-      user: { $in: followingIds },
-      isArchived: false,
-    })
-      .populate("user", "username fullName profilePicture verified")
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(parseInt(limit));
-
-    // Update views
-    for (const post of posts) {
-      post.views += 1;
-      await post.save();
-    }
-
-    res.json({
-      success: true,
-      posts,
-      total: posts.length,
-      page: parseInt(page),
-      limit: parseInt(limit),
-    });
-  } catch (error) {
-    console.error("Get feed error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to get feed",
-    });
-  }
-};
-// ==================== GET USER POSTS ====================
-export const getUserPosts = async (req, res) => {
-  try {
-    const { username } = req.params;
-    const userId = req.user._id; // Current logged-in user
-
-    console.log(`Fetching posts for user: ${username} by viewer: ${userId}`);
-
-    // Find the target user by username
-    const targetUser = await User.findOne({
-      username: { $regex: new RegExp(`^${username}$`, 'i') }
-    }).select("username fullName profilePicture bio followers following");
-
-    if (!targetUser) {
-      return res.status(404).json({
-        success: false,
-        error: "User not found",
-      });
-    }
-
-    // Get all posts by this user
-    const posts = await Post.find({
-      user: targetUser._id,
-      isArchived: false
-    })
-      .populate("user", "username fullName profilePicture verified")
-      .sort({ createdAt: -1 });
-
-    // Format posts with additional info
-    const formattedPosts = posts.map(post => {
-      const isLiked = post.likes.some(
-        likeId => likeId && likeId.toString() === userId.toString()
-      );
-
-      return {
-        _id: post._id,
-        user: {
-          _id: post.user._id,
-          username: post.user.username,
-          fullName: post.user.fullName,
-          profilePicture: post.user.profilePicture,
-          verified: post.user.verified || false
-        },
-        caption: post.caption || "",
-        media: post.media || [],
-        mediaType: post.mediaType || "image",
-        likes: post.likes || [],
-        likesCount: post.likes.length || 0,
-        comments: post.comments || [],
-        commentsCount: post.comments.length || 0,
-        views: post.views || 0,
-        shares: post.shares || 0,
-        isLiked: isLiked,
-        location: post.location || "",
-        tags: post.tags || [],
-        createdAt: post.createdAt,
-        updatedAt: post.updatedAt
-      };
-    });
-
-    // Check if current user follows this user
-    const isFollowing = targetUser.followers.some(
-      followerId => followerId && followerId.toString() === userId.toString()
-    );
-
-    const userInfo = {
-      _id: targetUser._id,
-      username: targetUser.username,
-      fullName: targetUser.fullName,
-      profilePicture: targetUser.profilePicture || "",
-      bio: targetUser.bio || "",
-      followersCount: targetUser.followers?.length || 0,
-      followingCount: targetUser.following?.length || 0,
-      postsCount: formattedPosts.length,
-      isFollowing: isFollowing,
-      isOwnProfile: targetUser._id.toString() === userId.toString()
-    };
-
-    res.status(200).json({
-      success: true,
-      posts: formattedPosts,
-      userInfo: userInfo,
-      totalPosts: formattedPosts.length,
-      message: `Found ${formattedPosts.length} posts for ${username}`
-    });
-
-  } catch (error) {
-    console.error("Error in getUserPosts:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to fetch user posts",
-      message: error.message
-    });
-  }
-};
+// Toggle like post
 export const toggleLikePost = async (req, res) => {
-  try {
-    const { postId } = req.params;
-    const userId = req.user._id;
+    try {
+        const { postId } = req.params;
+        const userId = req.user._id;
 
-    const post = await Post.findById(postId);
-    if (!post) {
-      return res.status(404).json({
-        success: false,
-        error: "Post not found",
-      });
-    }
+        if (!isValidObjectId(postId)) {
+            return res.status(400).json({ 
+                success: false,
+                error: "Invalid post ID" 
+            });
+        }
 
-    const isLiked = post.likes.includes(userId);
+        const post = await Post.findById(postId);
 
-    if (isLiked) {
-      // Unlike
-      post.likes.pull(userId);
-      await post.save();
-    } else {
-      // Like
-      post.likes.push(userId);
-      await post.save();
+        if (!post) {
+            return res.status(404).json({ 
+                success: false,
+                error: "Post not found" 
+            });
+        }
 
-      // Create notification if not liking own post
-      if (post.user.toString() !== userId.toString()) {
-        await Notification.create({
-          recipient: post.user,
-          sender: userId,
-          type: "like",
-          post: postId,
+        const isLiked = post.likes?.includes(userId.toString()) || false;
+
+        if (isLiked) {
+            // Unlike
+            post.likes = post.likes.filter(id => id.toString() !== userId.toString());
+        } else {
+            // Like
+            if (!post.likes) post.likes = [];
+            post.likes.push(userId);
+        }
+
+        await post.save();
+
+        // Create notification if not liking own post
+        if (post.user.toString() !== userId.toString() && !isLiked) {
+            const notification = new Notification({
+                recipient: post.user,
+                sender: userId,
+                type: "like",
+                post: postId,
+            });
+            await notification.save();
+        }
+
+        res.status(200).json({
+            success: true,
+            liked: !isLiked,
+            likesCount: post.likes?.length || 0,
         });
-      }
+    } catch (error) {
+        console.error("Error in toggleLikePost:", error.message);
+        res.status(500).json({ 
+            success: false,
+            error: "Internal server error" 
+        });
     }
-
-    res.json({
-      success: true,
-      liked: !isLiked,
-      likesCount: post.likes.length,
-    });
-  } catch (error) {
-    console.error("Toggle like error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to toggle like",
-    });
-  }
 };
 
+// Get user posts
+export const getUserPosts = async (req, res) => {
+    try {
+        const { username } = req.params;
+        const userId = req.user._id;
+
+        const user = await User.findOne({ username });
+        if (!user) {
+            return res.status(404).json({ 
+                success: false,
+                error: "User not found" 
+            });
+        }
+
+        const posts = await Post.find({ user: user._id })
+            .populate("user", "username profilePicture name")
+            .sort({ createdAt: -1 })
+            .lean();
+
+        // Add like status for current user
+        const postsWithLikeStatus = posts.map(post => ({
+            ...post,
+            isLiked: post.likes?.includes(userId.toString()) || false,
+            likesCount: post.likes?.length || 0,
+            commentsCount: post.comments?.length || 0
+        }));
+
+        res.status(200).json({
+            success: true,
+            posts: postsWithLikeStatus,
+            user: {
+                _id: user._id.toString(),
+                username: user.username,
+                name: user.name || user.username,
+                profilePicture: user.profilePicture,
+                bio: user.bio,
+                followers: user.followers?.length || 0,
+                following: user.following?.length || 0,
+                isFollowing: user.followers?.includes(userId.toString()) || false
+            },
+            total: postsWithLikeStatus.length
+        });
+    } catch (error) {
+        console.error("Error in getUserPosts:", error.message);
+        res.status(500).json({ 
+            success: false,
+            error: "Internal server error",
+            posts: []
+        });
+    }
+};
+
+// ========== COMMENT CONTROLLERS ==========
+
+// Add comment - FIXED: This was missing
+export const addComment = async (req, res) => {
+    try {
+        const { postId } = req.params;
+        const { text } = req.body;
+        const userId = req.user._id;
+
+        if (!isValidObjectId(postId)) {
+            return res.status(400).json({ 
+                success: false,
+                error: "Invalid post ID" 
+            });
+        }
+
+        if (!text?.trim()) {
+            return res.status(400).json({ 
+                success: false,
+                error: "Comment text is required" 
+            });
+        }
+
+        const post = await Post.findById(postId);
+        if (!post) {
+            return res.status(404).json({ 
+                success: false,
+                error: "Post not found" 
+            });
+        }
+
+        const comment = new Comment({
+            user: userId,
+            post: postId,
+            text: text.trim(),
+        });
+
+        await comment.save();
+
+        // Add comment to post
+        if (!post.comments) post.comments = [];
+        post.comments.push(comment._id);
+        await post.save();
+
+        // Populate comment with user info
+        const populatedComment = await Comment.findById(comment._id).populate(
+            "user",
+            "username profilePicture name"
+        );
+
+        // Create notification if not commenting on own post
+        if (post.user.toString() !== userId.toString()) {
+            const notification = new Notification({
+                recipient: post.user,
+                sender: userId,
+                type: "comment",
+                post: postId,
+                comment: comment._id,
+            });
+            await notification.save();
+        }
+
+        res.status(201).json({
+            success: true,
+            comment: populatedComment
+        });
+    } catch (error) {
+        console.error("Error in addComment:", error.message);
+        res.status(500).json({ 
+            success: false,
+            error: "Internal server error" 
+        });
+    }
+};
+
+// Get post comments - FIXED: This was missing
+export const getPostComments = async (req, res) => {
+    try {
+        const { postId } = req.params;
+
+        if (!isValidObjectId(postId)) {
+            return res.status(400).json({ 
+                success: false,
+                error: "Invalid post ID" 
+            });
+        }
+
+        const comments = await Comment.find({ post: postId })
+            .populate("user", "username profilePicture name")
+            .sort({ createdAt: -1 })
+            .lean();
+
+        res.status(200).json({
+            success: true,
+            comments: comments,
+            total: comments.length
+        });
+    } catch (error) {
+        console.error("Error in getPostComments:", error.message);
+        res.status(500).json({ 
+            success: false,
+            error: "Internal server error",
+            comments: []
+        });
+    }
+};
+
+// Delete comment - FIXED: This was missing
+export const deleteComment = async (req, res) => {
+    try {
+        const { postId, commentId } = req.params;
+        const userId = req.user._id;
+
+        if (!isValidObjectId(commentId) || !isValidObjectId(postId)) {
+            return res.status(400).json({ 
+                success: false,
+                error: "Invalid ID format" 
+            });
+        }
+
+        const comment = await Comment.findById(commentId);
+        if (!comment) {
+            return res.status(404).json({ 
+                success: false,
+                error: "Comment not found" 
+            });
+        }
+
+        // Check if user owns the comment
+        if (comment.user.toString() !== userId.toString()) {
+            return res.status(403).json({ 
+                success: false,
+                error: "Not authorized to delete this comment" 
+            });
+        }
+
+        // Remove comment from post
+        await Post.findByIdAndUpdate(postId, {
+            $pull: { comments: commentId },
+        });
+
+        // Delete comment
+        await Comment.findByIdAndDelete(commentId);
+
+        res.status(200).json({ 
+            success: true, 
+            message: "Comment deleted successfully" 
+        });
+    } catch (error) {
+        console.error("Error in deleteComment:", error.message);
+        res.status(500).json({ 
+            success: false,
+            error: "Internal server error" 
+        });
+    }
+};
+
+// ========== SEARCH CONTROLLERS ==========
+
+// Search posts - FIXED: This was missing
+export const searchPosts = async (req, res) => {
+    try {
+        const { q } = req.query;
+        const userId = req.user._id;
+
+        if (!q) {
+            return res.status(400).json({ 
+                success: false,
+                error: "Search query is required" 
+            });
+        }
+
+        const posts = await Post.find({
+            $or: [
+                { caption: { $regex: q, $options: "i" } },
+                { tags: { $regex: q, $options: "i" } }
+            ],
+        })
+            .populate("user", "username profilePicture name")
+            .sort({ createdAt: -1 })
+            .limit(50)
+            .lean();
+
+        // Add like status for current user
+        const postsWithLikeStatus = posts.map(post => ({
+            ...post,
+            isLiked: post.likes?.includes(userId.toString()) || false,
+            likesCount: post.likes?.length || 0,
+            commentsCount: post.comments?.length || 0
+        }));
+
+        res.status(200).json({
+            success: true,
+            posts: postsWithLikeStatus,
+            total: postsWithLikeStatus.length,
+            query: q
+        });
+    } catch (error) {
+        console.error("Error in searchPosts:", error.message);
+        res.status(500).json({ 
+            success: false,
+            error: "Internal server error",
+            posts: []
+        });
+    }
+};
+
+// Delete post - FIXED: This was missing
+export const deletePost = async (req, res) => {
+    try {
+        const { postId } = req.params;
+        const userId = req.user._id;
+
+        if (!isValidObjectId(postId)) {
+            return res.status(400).json({ 
+                success: false,
+                error: "Invalid post ID" 
+            });
+        }
+
+        const post = await Post.findById(postId);
+        if (!post) {
+            return res.status(404).json({ 
+                success: false,
+                error: "Post not found" 
+            });
+        }
+
+        // Check if user owns the post
+        if (post.user.toString() !== userId.toString()) {
+            return res.status(403).json({ 
+                success: false,
+                error: "Not authorized to delete this post" 
+            });
+        }
+
+        // Delete all comments on this post
+        await Comment.deleteMany({ post: postId });
+
+        // Delete post
+        await Post.findByIdAndDelete(postId);
+
+        res.status(200).json({ 
+            success: true, 
+            message: "Post deleted successfully" 
+        });
+    } catch (error) {
+        console.error("Error in deletePost:", error.message);
+        res.status(500).json({ 
+            success: false,
+            error: "Internal server error" 
+        });
+    }
+};
+
+// ========== NOTIFICATION CONTROLLERS ==========
+
+// Get notifications - FIXED: This was missing
 export const getNotifications = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const { limit = 20, skip = 0 } = req.query;
+    try {
+        const userId = req.user._id;
 
-    const notifications = await Notification.find({
-      recipient: userId,
-    })
-      .populate("sender", "username fullName profilePicture")
-      .populate("post", "media mediaType caption")
-      .populate("reel", "thumbnail caption")
-      .populate("comment")
-      .sort({ createdAt: -1 })
-      .skip(parseInt(skip))
-      .limit(parseInt(limit));
+        const notifications = await Notification.find({ recipient: userId })
+            .populate("sender", "username profilePicture name")
+            .populate("post")
+            .populate("comment")
+            .sort({ createdAt: -1 })
+            .limit(50)
+            .lean();
 
-    // Mark as read
-    await Notification.updateMany(
-      { recipient: userId, read: false },
-      { read: true }
-    );
+        // Mark as read if not already
+        const unreadNotificationIds = notifications
+            .filter(n => !n.read)
+            .map(n => n._id);
 
-    res.json({
-      success: true,
-      notifications,
-      unreadCount: await Notification.countDocuments({
-        recipient: userId,
-        read: false,
-      }),
+        if (unreadNotificationIds.length > 0) {
+            await Notification.updateMany(
+                { _id: { $in: unreadNotificationIds } },
+                { $set: { read: true, readAt: new Date() } }
+            );
+        }
+
+        res.status(200).json({
+            success: true,
+            notifications: notifications,
+            total: notifications.length,
+            unreadCount: unreadNotificationIds.length
+        });
+
+    } catch (error) {
+        console.error("Error in getNotifications:", error.message);
+        res.status(500).json({ 
+            success: false,
+            error: "Internal server error",
+            notifications: []
+        });
+    }
+};
+
+// ========== DEBUG CONTROLLER ==========
+
+// Debug endpoint
+export const debugChatData = async (req, res) => {
+    try {
+        const userId = req.user._id;
+        
+        const currentUser = await User.findById(userId).select("-password").lean();
+        const allUsers = await User.find({}).select("username email profilePicture").lean();
+        
+        const userMessages = await Message.find({
+            $or: [{ senderId: userId }, { receiverId: userId }]
+        })
+        .populate("senderId", "username")
+        .populate("receiverId", "username")
+        .sort({ createdAt: -1 })
+        .lean();
+
+        const conversations = await Conversation.find({
+            participants: userId
+        })
+        .populate("participants", "username")
+        .lean();
+
+        res.json({
+            success: true,
+            currentUser: {
+                _id: currentUser._id.toString(),
+                username: currentUser.username
+            },
+            stats: {
+                totalUsers: allUsers.length,
+                totalMessages: userMessages.length,
+                totalConversations: conversations.length
+            },
+            sampleUsers: allUsers.slice(0, 5).map(u => ({
+                _id: u._id.toString(),
+                username: u.username,
+                profilePicture: u.profilePicture || 'none'
+            })),
+            recentMessages: userMessages.slice(0, 5).map(m => ({
+                _id: m._id.toString(),
+                text: m.text?.substring(0, 50) || m.messageType,
+                sender: m.senderId?.username,
+                receiver: m.receiverId?.username
+            }))
+        });
+
+    } catch (error) {
+        console.error("Debug error:", error);
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
+    }
+};
+
+// ========== MULTER MIDDLEWARE ==========
+
+// Middleware for handling file uploads
+export const uploadMiddleware = (req, res, next) => {
+    upload.single("file")(req, res, (err) => {
+        if (err) {
+            return res.status(400).json({ 
+                success: false,
+                error: err.message 
+            });
+        }
+        next();
     });
-  } catch (error) {
-    console.error("Get notifications error:", error);
-    res.status(500).json({
-      success: false,
-      error: "Failed to get notifications",
+};
+
+// Middleware for voice uploads
+export const uploadVoiceMiddleware = (req, res, next) => {
+    upload.single("voice")(req, res, (err) => {
+        if (err) {
+            return res.status(400).json({ 
+                success: false,
+                error: err.message 
+            });
+        }
+        next();
     });
-  }
 };

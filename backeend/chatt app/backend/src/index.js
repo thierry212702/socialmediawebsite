@@ -30,19 +30,18 @@ const __dirname = path.dirname(__filename);
 // Socket.io configuration
 const io = new Server(server, {
     cors: {
-        origin: process.env.CLIENT_URL || "http://localhost:3002",
+        origin: process.env.CLIENT_URL || "http://localhost:3000",
         credentials: true,
         methods: ["GET", "POST", "PUT", "DELETE"],
+        allowedHeaders: ["Content-Type", "Authorization", "Cookie", "X-Requested-With", "Cache-Control"]
     },
     transports: ["websocket", "polling"],
 });
 
 const PORT = process.env.PORT || 5001;
-console.log('CORS Origin:', process.env.CLIENT_URL || "http://localhost:3001");
-// ========== MIDDLEWARE ==========
-// ========== MIDDLEWARE ==========
 
-// Allow ALL localhost ports in development
+// ========== MIDDLEWARE ==========
+// ✅ UPDATED CORS CONFIGURATION - FIXED!
 app.use(
     cors({
         origin: function (origin, callback) {
@@ -77,13 +76,33 @@ app.use(
         },
         credentials: true,
         methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-        allowedHeaders: ["Content-Type", "Authorization", "Cookie", "X-Requested-With"],
-        exposedHeaders: ["Set-Cookie"],
-        maxAge: 86400
+        allowedHeaders: [
+            "Content-Type", 
+            "Authorization", 
+            "Cookie", 
+            "X-Requested-With", 
+            "Cache-Control",  // ✅ ADDED THIS
+            "Accept",
+            "Origin",
+            "x-auth-token",
+            "user-agent",
+            "host",
+            "connection",
+            "upgrade",
+            "pragma",
+            "cache-control",
+            "sec-fetch-dest",
+            "sec-fetch-mode",
+            "sec-fetch-site"
+        ],
+        exposedHeaders: ["Set-Cookie", "Authorization", "Content-Length", "X-Request-Id"],
+        maxAge: 86400,
+        preflightContinue: false,
+        optionsSuccessStatus: 204
     })
 );
 
-// Handle preflight requests for ALL routes
+// ✅ Explicitly handle OPTIONS requests
 app.options('*', cors());
 
 // Body parsers
@@ -122,22 +141,39 @@ app.get("/api/health", (req, res) => {
         message: "Server is running",
         timestamp: new Date().toISOString(),
         uptime: process.uptime(),
+        cors: {
+            origin: req.headers.origin || "No origin header",
+            allowed: true
+        }
     });
 });
 
-// ========== ERROR HANDLING ==========
+// ========== CORS TEST ENDPOINTS ==========
+app.get("/api/cors-test", (req, res) => {
+    res.json({
+        success: true,
+        message: "CORS is working!",
+        timestamp: new Date().toISOString(),
+        headers: req.headers,
+        origin: req.headers.origin
+    });
+});
 
-// 404 handler
+// ========== 404 HANDLER ==========
 app.use((req, res, next) => {
     res.status(404).json({
         success: false,
         message: `Route ${req.originalUrl} not found`,
+        method: req.method,
+        allowedMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
     });
 });
 
+// ========== ERROR HANDLING ==========
 // Global error handler
 app.use((err, req, res, next) => {
-    console.error("🔥 Server Error:", err.stack);
+    console.error("🔥 Server Error:", err.message);
+    console.error("Stack:", err.stack);
 
     const statusCode = err.statusCode || 500;
     const message = err.message || "Internal Server Error";
@@ -145,7 +181,11 @@ app.use((err, req, res, next) => {
     res.status(statusCode).json({
         success: false,
         message: process.env.NODE_ENV === "development" ? message : "Something went wrong!",
-        ...(process.env.NODE_ENV === "development" && { stack: err.stack }),
+        ...(process.env.NODE_ENV === "development" && { 
+            stack: err.stack,
+            path: req.path,
+            method: req.method 
+        }),
     });
 });
 
@@ -160,10 +200,13 @@ const startServer = async () => {
             console.log(`🚀 Server running on PORT: ${PORT}`);
             console.log(`🌐 API URL: http://localhost:${PORT}`);
             console.log(`🔗 Health check: http://localhost:${PORT}/api/health`);
+            console.log(`🔄 CORS Test: http://localhost:${PORT}/api/cors-test`);
             console.log(`💬 Socket.io connected`);
+            console.log(`🔧 CORS configured for all localhost origins`);
 
             if (process.env.NODE_ENV === "development") {
                 console.log(`📁 Uploads folder: http://localhost:${PORT}/uploads`);
+                console.log(`⚠️  CORS is in development mode - allowing all origins`);
             }
         });
 

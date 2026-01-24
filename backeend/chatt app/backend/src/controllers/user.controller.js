@@ -1,11 +1,15 @@
+// controllers/user.controller.js - COMPLETE UPDATED VERSION
 import User from "../models/user.model.js";
 import Conversation from "../models/conversation.model.js";
 import Message from "../models/message.model.js";
 import Post from "../models/Post.model.js";
 import Reel from "../models/Reel.model.js";
-import Comment from "../models/Comment.model.js";
-import Notification from "../models/Notification.model.js";
+import Comment from "../models/comment.model.js";
+import Notification from "../models/notification.model.js";
 import cloudinary from "../lib/cloudinary.js";
+import bcrypt from "bcrypt";
+
+// ========== SEARCH & PROFILE CONTROLLERS ==========
 
 export const searchUsers = async (req, res) => {
     try {
@@ -172,60 +176,6 @@ export const getUserProfile = async (req, res) => {
     }
 };
 
-export const updateUserStatus = async (req, res) => {
-    try {
-        const { status, lastSeen } = req.body;
-        const userId = req.user._id;
-
-        // Validate status
-        const validStatuses = ['online', 'offline', 'away'];
-        if (status && !validStatuses.includes(status)) {
-            return res.status(400).json({
-                success: false,
-                message: "Invalid status. Must be 'online', 'offline', or 'away'"
-            });
-        }
-
-        const updateData = {};
-        if (status !== undefined) updateData.status = status;
-        if (lastSeen !== undefined) {
-            updateData.lastSeen = new Date(lastSeen);
-        } else if (status === 'offline') {
-            updateData.lastSeen = new Date();
-        }
-
-        const user = await User.findByIdAndUpdate(
-            userId,
-            updateData,
-            { new: true }
-        ).select("-password");
-
-        // Notify connections about status change
-        // This would typically be done via Socket.io
-        // For now, we'll just return the updated user
-
-        res.status(200).json({
-            success: true,
-            user: {
-                _id: user._id,
-                username: user.username,
-                status: user.status,
-                lastSeen: user.lastSeen,
-                profilePicture: user.profilePicture
-            }
-        });
-    } catch (error) {
-        console.error("Error in updateUserStatus:", error.message);
-        res.status(500).json({
-            success: false,
-            error: "Internal server error"
-        });
-    }
-};
-
-// ==================== NEW FUNCTIONS ====================
-
-// Get user by username
 export const getUserByUsername = async (req, res) => {
     try {
         const { username } = req.params;
@@ -303,7 +253,8 @@ export const getUserByUsername = async (req, res) => {
     }
 };
 
-// Follow user
+// ========== FOLLOW/UNFOLLOW CONTROLLERS ==========
+
 export const followUser = async (req, res) => {
     try {
         const { userId } = req.params;
@@ -364,7 +315,6 @@ export const followUser = async (req, res) => {
     }
 };
 
-// Unfollow user
 export const unfollowUser = async (req, res) => {
     try {
         const { userId } = req.params;
@@ -406,206 +356,6 @@ export const unfollowUser = async (req, res) => {
         res.status(500).json({
             success: false,
             error: "Internal server error"
-        });
-    }
-};
-
-// Get suggested users
-export const getSuggestedUsers = async (req, res) => {
-    try {
-        const currentUserId = req.user._id;
-
-        // Get users that current user doesn't follow, excluding self
-        const suggestedUsers = await User.find({
-            _id: { $ne: currentUserId },
-            followers: { $ne: currentUserId }
-        })
-            .select("username fullName profilePicture verified bio followers")
-            .sort({ followers: -1 }) // Most popular first
-            .limit(10);
-
-        const formattedUsers = suggestedUsers.map(user => ({
-            _id: user._id,
-            username: user.username,
-            fullName: user.fullName,
-            profilePicture: user.profilePicture,
-            isVerified: user.verified,
-            bio: user.bio,
-            followersCount: user.followers.length,
-            isFollowing: false
-        }));
-
-        res.status(200).json({
-            success: true,
-            users: formattedUsers
-        });
-    } catch (error) {
-        console.error("Error in getSuggestedUsers:", error.message);
-        res.status(500).json({
-            success: false,
-            error: "Internal server error"
-        });
-    }
-};
-
-export const deleteUserAccount = async (req, res) => {
-    try {
-        const userId = req.user._id;
-        const { password } = req.body;
-
-        // Require password confirmation for security
-        if (!password) {
-            return res.status(400).json({
-                success: false,
-                message: "Password confirmation is required"
-            });
-        }
-
-        // Verify password
-        const user = await User.findById(userId);
-        if (!user) {
-            return res.status(404).json({
-                success: false,
-                message: "User not found"
-            });
-        }
-
-        const bcrypt = require('bcrypt');
-        const isPasswordValid = await bcrypt.compare(password, user.password);
-        if (!isPasswordValid) {
-            return res.status(400).json({
-                success: false,
-                message: "Invalid password"
-            });
-        }
-
-        console.log(`Starting account deletion for user: ${userId}`);
-
-        // 1. Delete user's profile picture from Cloudinary if exists
-        if (user.profilePicture) {
-            try {
-                const publicId = user.profilePicture.split('/').pop().split('.')[0];
-                await cloudinary.uploader.destroy(`profile-pictures/${publicId}`);
-                console.log('Profile picture deleted from Cloudinary');
-            } catch (cloudinaryError) {
-                console.warn('Could not delete profile picture from Cloudinary:', cloudinaryError.message);
-            }
-        }
-
-        // 2. Delete user's posts and their media
-        const userPosts = await Post.find({ user: userId });
-        for (const post of userPosts) {
-            // Delete post media from Cloudinary
-            for (const mediaUrl of post.media) {
-                try {
-                    const publicId = mediaUrl.split('/').pop().split('.')[0];
-                    await cloudinary.uploader.destroy(`posts/${publicId}`);
-                } catch (error) {
-                    console.warn(`Could not delete media ${mediaUrl}:`, error.message);
-                }
-            }
-        }
-        await Post.deleteMany({ user: userId });
-        console.log(`Deleted ${userPosts.length} posts`);
-
-        // 3. Delete user's reels and their media
-        const userReels = await Reel.find({ user: userId });
-        for (const reel of userReels) {
-            try {
-                const videoPublicId = reel.video.split('/').pop().split('.')[0];
-                await cloudinary.uploader.destroy(`reels/${videoPublicId}`, { resource_type: 'video' });
-
-                if (reel.thumbnail) {
-                    const thumbPublicId = reel.thumbnail.split('/').pop().split('.')[0];
-                    await cloudinary.uploader.destroy(`reels/${thumbPublicId}`);
-                }
-            } catch (error) {
-                console.warn(`Could not delete reel ${reel._id}:`, error.message);
-            }
-        }
-        await Reel.deleteMany({ user: userId });
-        console.log(`Deleted ${userReels.length} reels`);
-
-        // 4. Delete user's comments
-        await Comment.deleteMany({ user: userId });
-        console.log('Deleted user comments');
-
-        // 5. Delete user's messages
-        await Message.deleteMany({
-            $or: [{ senderId: userId }, { receiveId: userId }],
-        });
-        console.log('Deleted user messages');
-
-        // 6. Delete user's conversations
-        await Conversation.deleteMany({
-            participants: userId,
-        });
-        console.log('Deleted user conversations');
-
-        // 7. Delete notifications involving the user
-        await Notification.deleteMany({
-            $or: [
-                { recipient: userId },
-                { sender: userId }
-            ]
-        });
-        console.log('Deleted user notifications');
-
-        // 8. Remove user from other users' followers/following lists
-        await User.updateMany(
-            { followers: userId },
-            { $pull: { followers: userId } }
-        );
-
-        await User.updateMany(
-            { following: userId },
-            { $pull: { following: userId } }
-        );
-        console.log('Removed user from followers/following lists');
-
-        // 9. Remove user from post/reel likes and saves
-        await Post.updateMany(
-            { likes: userId },
-            { $pull: { likes: userId } }
-        );
-
-        await Post.updateMany(
-            { saves: userId },
-            { $pull: { saves: userId } }
-        );
-
-        await Reel.updateMany(
-            { likes: userId },
-            { $pull: { likes: userId } }
-        );
-
-        await Reel.updateMany(
-            { saves: userId },
-            { $pull: { saves: userId } }
-        );
-        console.log('Removed user from likes and saves');
-
-        // 10. Delete the user
-        await User.findByIdAndDelete(userId);
-        console.log('User deleted from database');
-
-        // 11. Clear authentication cookie
-        res.clearCookie("jwt", {
-            httpOnly: true,
-            sameSite: "strict",
-            secure: process.env.NODE_ENV === "production"
-        });
-
-        res.status(200).json({
-            success: true,
-            message: "Account and all associated data deleted successfully"
-        });
-
-    } catch (error) {
-        console.error("Error in deleteUserAccount:", error.message);
-        res.status(500).json({
-            success: false,
-            error: "Failed to delete account. Please try again later."
         });
     }
 };
@@ -725,6 +475,159 @@ export const getFollowing = async (req, res) => {
         });
     }
 };
+
+// ========== SUGGESTED USERS CONTROLLERS ==========
+
+export const getSuggestedUsers = async (req, res) => {
+    try {
+        const currentUserId = req.user._id;
+
+        // Get users that current user doesn't follow, excluding self
+        const suggestedUsers = await User.find({
+            _id: { $ne: currentUserId },
+            followers: { $ne: currentUserId }
+        })
+            .select("username fullName profilePicture verified bio followers")
+            .sort({ followers: -1 }) // Most popular first
+            .limit(10);
+
+        const formattedUsers = suggestedUsers.map(user => ({
+            _id: user._id,
+            username: user.username,
+            fullName: user.fullName,
+            profilePicture: user.profilePicture,
+            isVerified: user.verified,
+            bio: user.bio,
+            followersCount: user.followers.length,
+            isFollowing: false
+        }));
+
+        res.status(200).json({
+            success: true,
+            users: formattedUsers
+        });
+    } catch (error) {
+        console.error("Error in getSuggestedUsers:", error.message);
+        res.status(500).json({
+            success: false,
+            error: "Internal server error"
+        });
+    }
+};
+
+export const getSuggestedMessagingUsers = async (req, res) => {
+    try {
+        const currentUserId = req.user._id;
+        const currentUser = await User.findById(currentUserId);
+
+        // Get users you follow
+        const followingUsers = await User.find({
+            _id: { $in: currentUser.following }
+        }).select("username fullName profilePicture verified bio followers");
+
+        // Get conversations to find users you've already messaged
+        const conversations = await Conversation.find({
+            participants: currentUserId
+        });
+
+        const messagedUserIds = conversations.flatMap(conv => 
+            conv.participants.map(p => p.toString())
+        ).filter(id => id !== currentUserId.toString());
+
+        // Filter out users you've already messaged
+        const suggestedUsers = followingUsers.filter(
+            user => !messagedUserIds.includes(user._id.toString())
+        );
+
+        const formattedUsers = suggestedUsers.map(user => ({
+            _id: user._id,
+            username: user.username,
+            fullName: user.fullName,
+            profilePicture: user.profilePicture,
+            isVerified: user.verified,
+            bio: user.bio,
+            followersCount: user.followers.length,
+            isFollowing: true, // Since they're in your following list
+            hasFollowedYou: user.followers.includes(currentUserId),
+            canMessage: true
+        }));
+
+        res.status(200).json({
+            success: true,
+            users: formattedUsers,
+            total: formattedUsers.length
+        });
+    } catch (error) {
+        console.error("Error in getSuggestedMessagingUsers:", error.message);
+        res.status(500).json({
+            success: false,
+            error: "Internal server error"
+        });
+    }
+};
+
+export const getMessagedUsers = async (req, res) => {
+    try {
+        const currentUserId = req.user._id;
+
+        // Get all conversations
+        const conversations = await Conversation.find({
+            participants: currentUserId
+        })
+        .populate({
+            path: 'participants',
+            select: 'username fullName profilePicture verified status lastSeen',
+            match: { _id: { $ne: currentUserId } }
+        })
+        .populate({
+            path: 'lastMessage',
+            select: 'text messageType createdAt read senderId'
+        })
+        .sort({ updatedAt: -1 });
+
+        // Format the response
+        const messagedUsers = conversations
+            .filter(conv => conv.participants && conv.participants.length > 0)
+            .map(conv => {
+                const otherUser = conv.participants[0];
+                const lastMessage = conv.lastMessage;
+                
+                return {
+                    _id: otherUser._id,
+                    username: otherUser.username,
+                    fullName: otherUser.fullName,
+                    profilePicture: otherUser.profilePicture,
+                    isVerified: otherUser.verified,
+                    status: otherUser.status,
+                    lastSeen: otherUser.lastSeen,
+                    conversationId: conv._id,
+                    lastMessage: lastMessage ? {
+                        text: lastMessage.text,
+                        messageType: lastMessage.messageType,
+                        createdAt: lastMessage.createdAt,
+                        isOwn: lastMessage.senderId?.toString() === currentUserId.toString(),
+                        read: lastMessage.read
+                    } : null,
+                    unreadCount: conv.unreadCount?.get(currentUserId.toString()) || 0,
+                    updatedAt: conv.updatedAt
+                };
+            });
+
+        res.status(200).json({
+            success: true,
+            users: messagedUsers,
+            total: messagedUsers.length
+        });
+    } catch (error) {
+        console.error("Error in getMessagedUsers:", error.message);
+        res.status(500).json({
+            success: false,
+            error: "Internal server error"
+        });
+    }
+};
+
+// ========== SAVE/UNSAVE CONTENT CONTROLLERS ==========
 
 export const toggleSavePost = async (req, res) => {
     try {
@@ -867,6 +770,55 @@ export const getSavedContent = async (req, res) => {
     }
 };
 
+// ========== USER SETTINGS & STATUS CONTROLLERS ==========
+
+export const updateUserStatus = async (req, res) => {
+    try {
+        const { status, lastSeen } = req.body;
+        const userId = req.user._id;
+
+        // Validate status
+        const validStatuses = ['online', 'offline', 'away'];
+        if (status && !validStatuses.includes(status)) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid status. Must be 'online', 'offline', or 'away'"
+            });
+        }
+
+        const updateData = {};
+        if (status !== undefined) updateData.status = status;
+        if (lastSeen !== undefined) {
+            updateData.lastSeen = new Date(lastSeen);
+        } else if (status === 'offline') {
+            updateData.lastSeen = new Date();
+        }
+
+        const user = await User.findByIdAndUpdate(
+            userId,
+            updateData,
+            { new: true }
+        ).select("-password");
+
+        res.status(200).json({
+            success: true,
+            user: {
+                _id: user._id,
+                username: user.username,
+                status: user.status,
+                lastSeen: user.lastSeen,
+                profilePicture: user.profilePicture
+            }
+        });
+    } catch (error) {
+        console.error("Error in updateUserStatus:", error.message);
+        res.status(500).json({
+            success: false,
+            error: "Internal server error"
+        });
+    }
+};
+
 export const updateUserSettings = async (req, res) => {
     try {
         const userId = req.user._id;
@@ -908,6 +860,324 @@ export const updateUserSettings = async (req, res) => {
         });
     } catch (error) {
         console.error("Error in updateUserSettings:", error.message);
+        res.status(500).json({
+            success: false,
+            error: "Internal server error"
+        });
+    }
+};
+
+// ========== ACCOUNT MANAGEMENT CONTROLLERS ==========
+
+export const deleteUserAccount = async (req, res) => {
+    try {
+        const userId = req.user._id;
+        const { password } = req.body;
+
+        // Require password confirmation for security
+        if (!password) {
+            return res.status(400).json({
+                success: false,
+                message: "Password confirmation is required"
+            });
+        }
+
+        // Verify password
+        const user = await User.findById(userId);
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                message: "User not found"
+            });
+        }
+
+        const isPasswordValid = await bcrypt.compare(password, user.password);
+        if (!isPasswordValid) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid password"
+            });
+        }
+
+        console.log(`Starting account deletion for user: ${userId}`);
+
+        // 1. Delete user's profile picture from Cloudinary if exists
+        if (user.profilePicture) {
+            try {
+                const publicId = user.profilePicture.split('/').pop().split('.')[0];
+                await cloudinary.uploader.destroy(`profile-pictures/${publicId}`);
+                console.log('Profile picture deleted from Cloudinary');
+            } catch (cloudinaryError) {
+                console.warn('Could not delete profile picture from Cloudinary:', cloudinaryError.message);
+            }
+        }
+
+        // 2. Delete user's posts and their media
+        const userPosts = await Post.find({ user: userId });
+        for (const post of userPosts) {
+            // Delete post media from Cloudinary
+            for (const mediaUrl of post.media) {
+                try {
+                    const publicId = mediaUrl.split('/').pop().split('.')[0];
+                    await cloudinary.uploader.destroy(`posts/${publicId}`);
+                } catch (error) {
+                    console.warn(`Could not delete media ${mediaUrl}:`, error.message);
+                }
+            }
+        }
+        await Post.deleteMany({ user: userId });
+        console.log(`Deleted ${userPosts.length} posts`);
+
+        // 3. Delete user's reels and their media
+        const userReels = await Reel.find({ user: userId });
+        for (const reel of userReels) {
+            try {
+                const videoPublicId = reel.video.split('/').pop().split('.')[0];
+                await cloudinary.uploader.destroy(`reels/${videoPublicId}`, { resource_type: 'video' });
+
+                if (reel.thumbnail) {
+                    const thumbPublicId = reel.thumbnail.split('/').pop().split('.')[0];
+                    await cloudinary.uploader.destroy(`reels/${thumbPublicId}`);
+                }
+            } catch (error) {
+                console.warn(`Could not delete reel ${reel._id}:`, error.message);
+            }
+        }
+        await Reel.deleteMany({ user: userId });
+        console.log(`Deleted ${userReels.length} reels`);
+
+        // 4. Delete user's comments
+        await Comment.deleteMany({ user: userId });
+        console.log('Deleted user comments');
+
+        // 5. Delete user's messages
+        await Message.deleteMany({
+            $or: [{ senderId: userId }, { receiverId: userId }],
+        });
+        console.log('Deleted user messages');
+
+        // 6. Delete user's conversations
+        await Conversation.deleteMany({
+            participants: userId,
+        });
+        console.log('Deleted user conversations');
+
+        // 7. Delete notifications involving the user
+        await Notification.deleteMany({
+            $or: [
+                { recipient: userId },
+                { sender: userId }
+            ]
+        });
+        console.log('Deleted user notifications');
+
+        // 8. Remove user from other users' followers/following lists
+        await User.updateMany(
+            { followers: userId },
+            { $pull: { followers: userId } }
+        );
+
+        await User.updateMany(
+            { following: userId },
+            { $pull: { following: userId } }
+        );
+        console.log('Removed user from followers/following lists');
+
+        // 9. Remove user from post/reel likes and saves
+        await Post.updateMany(
+            { likes: userId },
+            { $pull: { likes: userId } }
+        );
+
+        await Post.updateMany(
+            { saves: userId },
+            { $pull: { saves: userId } }
+        );
+
+        await Reel.updateMany(
+            { likes: userId },
+            { $pull: { likes: userId } }
+        );
+
+        await Reel.updateMany(
+            { saves: userId },
+            { $pull: { saves: userId } }
+        );
+        console.log('Removed user from likes and saves');
+
+        // 10. Delete the user
+        await User.findByIdAndDelete(userId);
+        console.log('User deleted from database');
+
+        // 11. Clear authentication cookie
+        res.clearCookie("jwt", {
+            httpOnly: true,
+            sameSite: "strict",
+            secure: process.env.NODE_ENV === "production"
+        });
+
+        res.status(200).json({
+            success: true,
+            message: "Account and all associated data deleted successfully"
+        });
+
+    } catch (error) {
+        console.error("Error in deleteUserAccount:", error.message);
+        res.status(500).json({
+            success: false,
+            error: "Failed to delete account. Please try again later."
+        });
+    }
+};
+
+// ========== PROFILE COMPLETENESS CHECK ==========
+
+export const checkProfileCompleteness = async (req, res) => {
+    try {
+        const userId = req.user._id;
+        const user = await User.findById(userId).select('profilePicture bio website fullName');
+
+        let completenessScore = 0;
+        const totalPoints = 5;
+        const missingFields = [];
+
+        // Check profile picture (2 points)
+        if (user.profilePicture) {
+            completenessScore += 2;
+        } else {
+            missingFields.push('profile picture');
+        }
+
+        // Check bio (1 point)
+        if (user.bio && user.bio.trim() !== '') {
+            completenessScore += 1;
+        } else {
+            missingFields.push('bio');
+        }
+
+        // Check website (1 point)
+        if (user.website && user.website.trim() !== '') {
+            completenessScore += 1;
+        } else {
+            missingFields.push('website');
+        }
+
+        // Check full name (1 point)
+        if (user.fullName && user.fullName.trim() !== '') {
+            completenessScore += 1;
+        } else {
+            missingFields.push('full name');
+        }
+
+        const percentage = Math.round((completenessScore / totalPoints) * 100);
+
+        res.status(200).json({
+            success: true,
+            completeness: {
+                percentage,
+                score: completenessScore,
+                total: totalPoints,
+                missingFields,
+                isComplete: percentage >= 80
+            }
+        });
+    } catch (error) {
+        console.error("Error in checkProfileCompleteness:", error.message);
+        res.status(500).json({
+            success: false,
+            error: "Internal server error"
+        });
+    }
+};
+
+// ========== UPDATE PROFILE CONTROLLER ==========
+
+export const updateProfile = async (req, res) => {
+    try {
+        const userId = req.user._id;
+        const {
+            fullName,
+            bio,
+            website,
+            gender,
+            location,
+            profilePicture,
+            removeProfilePicture
+        } = req.body;
+
+        const updateData = {};
+
+        if (fullName !== undefined) updateData.fullName = fullName;
+        if (bio !== undefined) updateData.bio = bio;
+        if (website !== undefined) updateData.website = website;
+        if (gender !== undefined) updateData.gender = gender;
+        if (location !== undefined) updateData.location = location;
+
+        // Handle profile picture update
+        if (removeProfilePicture) {
+            // Remove profile picture
+            if (req.user.profilePicture) {
+                try {
+                    const publicId = req.user.profilePicture.split('/').pop().split('.')[0];
+                    await cloudinary.uploader.destroy(`profile-pictures/${publicId}`);
+                } catch (error) {
+                    console.warn('Could not delete old profile picture:', error.message);
+                }
+            }
+            updateData.profilePicture = null;
+        } else if (profilePicture) {
+            // Upload new profile picture
+            try {
+                const uploadResponse = await cloudinary.uploader.upload(profilePicture, {
+                    folder: 'profile-pictures',
+                    width: 500,
+                    height: 500,
+                    crop: 'fill'
+                });
+
+                // Delete old profile picture if exists
+                if (req.user.profilePicture) {
+                    const oldPublicId = req.user.profilePicture.split('/').pop().split('.')[0];
+                    await cloudinary.uploader.destroy(`profile-pictures/${oldPublicId}`);
+                }
+
+                updateData.profilePicture = uploadResponse.secure_url;
+            } catch (error) {
+                console.error('Error uploading profile picture:', error);
+                return res.status(500).json({
+                    success: false,
+                    error: 'Failed to upload profile picture'
+                });
+            }
+        }
+
+        const updatedUser = await User.findByIdAndUpdate(
+            userId,
+            updateData,
+            { new: true, runValidators: true }
+        ).select('-password');
+
+        res.status(200).json({
+            success: true,
+            message: 'Profile updated successfully',
+            user: {
+                _id: updatedUser._id,
+                username: updatedUser.username,
+                fullName: updatedUser.fullName,
+                email: updatedUser.email,
+                profilePicture: updatedUser.profilePicture,
+                bio: updatedUser.bio,
+                website: updatedUser.website,
+                gender: updatedUser.gender,
+                location: updatedUser.location,
+                isVerified: updatedUser.verified,
+                status: updatedUser.status,
+                lastSeen: updatedUser.lastSeen,
+                createdAt: updatedUser.createdAt
+            }
+        });
+    } catch (error) {
+        console.error("Error in updateProfile:", error.message);
         res.status(500).json({
             success: false,
             error: "Internal server error"

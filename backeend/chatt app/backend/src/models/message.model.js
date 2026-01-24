@@ -1,44 +1,63 @@
-import mongoose from "mongoose";
+import mongoose from 'mongoose';
 
-const messageSchema = new mongoose.Schema(
-    {
-        senderId: {
-            type: mongoose.Schema.Types.ObjectId,
-            ref: "User",
-            required: true,
-        },
-        receiverId: {  // Fixed: receiveId → receiverId
-            type: mongoose.Schema.Types.ObjectId,
-            ref: "User",
-            required: true,
-        },
-        text: {
+const messageSchema = new mongoose.Schema({
+    senderId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+        required: true
+    },
+    receiverId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+        required: true
+    },
+    text: {
+        type: String,
+        default: ''
+    },
+    image: {
+        url: String,
+        publicId: String
+    },
+    voiceMessage: {
+        url: String,
+        duration: Number, // in seconds
+        publicId: String
+    },
+    file: {
+        url: String,
+        filename: String,
+        size: Number,
+        type: String // 'pdf', 'doc', 'xls', etc.
+    },
+    messageType: {
+        type: String,
+        enum: ['text', 'image', 'voice', 'file', 'system'],
+        default: 'text'
+    },
+    callData: {
+        type: {
             type: String,
+            enum: ['audio', 'video']
         },
-        image: {
-            type: String,
-        },
-        // Optional: Add these fields for better functionality
+        duration: Number, // in seconds
         status: {
             type: String,
-            enum: ['sent', 'delivered', 'read'],
-            default: 'sent'
+            enum: ['missed', 'answered', 'declined']
         },
-        deleted: {
-            type: Boolean,
-            default: false
-        },
-        deletedBy: [{  // Track who deleted the message
-            type: mongoose.Schema.Types.ObjectId,
-            ref: "User"
-        }]
+        startedAt: Date,
+        endedAt: Date
     },
-    { timestamps: true }
-);
+    read: {
+        type: Boolean,
+        default: false
+    },
+    readAt: {
+        type: Date
+    }
+}, {
+    timestamps: true
+});
 
-// Optional: Add index for faster queries
-messageSchema.index({ senderId: 1, receiverId: 1, createdAt: -1 });
-
-const Message = mongoose.model("Message", messageSchema);
-
+const Message = mongoose.model('Message', messageSchema);
 export default Message;
