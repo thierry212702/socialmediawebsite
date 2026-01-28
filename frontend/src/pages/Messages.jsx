@@ -25,13 +25,14 @@ const Messages = () => {
   const [showEmojiPicker, setShowEmojiPicker] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const [currentChatUser, setCurrentChatUser] = useState(null)
+  const [isSending, setIsSending] = useState(false)
   const messagesEndRef = useRef(null)
   const { user } = useAuth()
   const { socket, isConnected } = useSocket()
   const queryClient = useQueryClient()
   
-  // Track sent message IDs to prevent duplicates
-  const sentMessageIdsRef = useRef(new Set())
+  // Track the last message we sent to prevent duplicates
+  const lastSentMessageRef = useRef(null)
 
   const { data: conversations } = useQuery({
     queryKey: ['conversations'],
@@ -56,14 +57,9 @@ const Messages = () => {
   })
 
   // Extract messages array from the response
-  const apiMessages = Array.isArray(messagesData) 
+  const messages = Array.isArray(messagesData) 
     ? messagesData 
     : messagesData?.messages || messagesData?.data || []
-
-  // Filter out duplicate messages by ID
-  const uniqueApiMessages = apiMessages.filter((msg, index, self) => 
-    index === self.findIndex(m => m._id === msg._id)
-  )
 
   // Listen for online/offline status updates via WebSocket
   useEffect(() => {
@@ -99,11 +95,14 @@ const Messages = () => {
       })
     }
 
+    // Only listen for messages from OTHER users (not our own)
     const handleNewMessage = (newMessage) => {
-      // Check if this is a duplicate message we already have
-      if (sentMessageIdsRef.current.has(newMessage._id)) {
-        console.log('Ignoring duplicate message from socket:', newMessage._id)
-        sentMessageIdsRef.current.delete(newMessage._id)
+      // If this is our own message that we just sent, ignore it
+      if (lastSentMessageRef.current && 
+          (newMessage._id === lastSentMessageRef.current._id || 
+           newMessage.text === lastSentMessageRef.current.text)) {
+        console.log('Ignoring our own message from socket')
+        lastSentMessageRef.current = null
         return
       }
 
@@ -114,31 +113,10 @@ const Messages = () => {
         (newMessage.receiverId?._id === userId)
 
       if (isForCurrentChat) {
-        // Add to sentMessageIds to prevent future duplicates
-        sentMessageIdsRef.current.add(newMessage._id)
-        
-        // Manually update the cache with the new message
-        queryClient.setQueryData(['messages', userId], (oldData) => {
-          const oldMessages = Array.isArray(oldData) 
-            ? oldData 
-            : oldData?.messages || oldData?.data || []
-          
-          // Check if message already exists
-          const alreadyExists = oldMessages.some(msg => 
-            msg._id === newMessage._id || 
-            (msg.text === newMessage.text && 
-             msg.senderId?._id === newMessage.senderId?._id &&
-             Math.abs(new Date(msg.createdAt) - new Date(newMessage.createdAt)) < 1000)
-          )
-          
-          if (alreadyExists) {
-            console.log('Message already in cache, skipping')
-            return oldData
-          }
-          
-          console.log('Adding new message to cache:', newMessage._id)
-          return [...oldMessages, newMessage]
-        })
+        // Refetch to get updated messages
+        setTimeout(() => {
+          refetchMessages()
+        }, 100)
       }
     }
 
@@ -151,7 +129,7 @@ const Messages = () => {
       socket.off('userOffline', handleUserOffline)
       socket.off('newMessage', handleNewMessage)
     }
-  }, [socket, isConnected, userId, queryClient])
+  }, [socket, isConnected, userId, queryClient, refetchMessages])
 
   // Find the current chat user from chatUsers list
   useEffect(() => {
@@ -169,48 +147,26 @@ const Messages = () => {
 
   useEffect(() => {
     scrollToBottom()
-  }, [uniqueApiMessages])
+  }, [messages])
 
   const handleSendMessage = async () => {
-    if (!message.trim() || !userId || !user) return
+    if (!message.trim() || !userId || !user || isSending) return
 
     const messageText = message.trim()
     setMessage('')
     setShowEmojiPicker(false)
+    setIsSending(true)
 
     try {
       // 1. Send via HTTP API
       const sentMessage = await chatService.sendMessage(userId, { text: messageText })
       
-      // Track this message ID to prevent duplicates
-      sentMessageIdsRef.current.add(sentMessage._id)
+      // Store the sent message to ignore it from socket
+      lastSentMessageRef.current = sentMessage
       
       console.log('Message sent successfully:', sentMessage._id)
 
-      // 2. Manually update the cache with the sent message
-      queryClient.setQueryData(['messages', userId], (oldData) => {
-        const oldMessages = Array.isArray(oldData) 
-          ? oldData 
-          : oldData?.messages || oldData?.data || []
-        
-        // Check if message already exists to prevent duplicates
-        const alreadyExists = oldMessages.some(msg => 
-          msg._id === sentMessage._id || 
-          (msg.text === sentMessage.text && 
-           msg.senderId?._id === sentMessage.senderId?._id &&
-           Math.abs(new Date(msg.createdAt) - new Date(sentMessage.createdAt)) < 1000)
-        )
-        
-        if (alreadyExists) {
-          console.log('Message already exists in cache, skipping')
-          return oldData
-        }
-        
-        console.log('Adding sent message to cache:', sentMessage._id)
-        return [...oldMessages, sentMessage]
-      })
-
-      // 3. If socket is connected, emit for real-time
+      // 2. If socket is connected, emit for real-time (but don't listen for it)
       if (socket && isConnected) {
         socket.emit('sendMessage', {
           receiverId: userId,
@@ -220,18 +176,21 @@ const Messages = () => {
         })
       }
 
-      // 4. Update conversations list
-      queryClient.invalidateQueries({ queryKey: ['conversations'] })
+      // 3. Refetch messages after sending
+      await refetchMessages()
+      
+      // 4. Scroll to bottom
+      scrollToBottom()
 
-      // 5. Scroll to bottom
-      setTimeout(() => {
-        scrollToBottom()
-      }, 100)
+      // 5. Update conversations list
+      queryClient.invalidateQueries({ queryKey: ['conversations'] })
 
     } catch (error) {
       console.error('Send message error:', error)
-      // Show error to user (you can add a toast notification here)
-      setMessage(messageText) // Restore the message so user can try again
+      // Restore the message so user can try again
+      setMessage(messageText)
+    } finally {
+      setIsSending(false)
     }
   }
 
@@ -468,7 +427,7 @@ const Messages = () => {
                 <div className="flex items-center justify-center h-full">
                   <div className="text-red-500">Error loading messages</div>
                 </div>
-              ) : uniqueApiMessages.length === 0 ? (
+              ) : messages.length === 0 ? (
                 <div className="flex items-center justify-center h-full">
                   <div className="text-center">
                     <MessageCircle className="w-16 h-16 text-gray-300 mx-auto mb-4" />
@@ -477,7 +436,7 @@ const Messages = () => {
                   </div>
                 </div>
               ) : (
-                uniqueApiMessages.map((msg) => {
+                messages.map((msg) => {
                   if (!msg || !msg.text) return null
                   
                   const isOwn = msg.senderId?._id === user?._id || 
@@ -528,10 +487,17 @@ const Messages = () => {
                 />
                 <button
                   onClick={handleSendMessage}
-                  disabled={!message.trim()}
-                  className="p-2 bg-blue-600 text-white rounded-full hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                  disabled={!message.trim() || isSending}
+                  className={`p-2 rounded-full ${isSending ? 'bg-blue-400' : 'bg-blue-600'} text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed`}
                 >
-                  <Send className="w-6 h-6" />
+                  {isSending ? (
+                    <span className="flex items-center">
+                      <span className="animate-spin mr-1">⏳</span>
+                      Sending...
+                    </span>
+                  ) : (
+                    <Send className="w-6 h-6" />
+                  )}
                 </button>
               </div>
             </div>
@@ -557,4 +523,3 @@ const Messages = () => {
 }
 
 export default Messages
-
